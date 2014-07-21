@@ -40,6 +40,7 @@ Veewee::Definition.declare({
     "configure_grub.sh",
     "postinstall.sh",
     "cleanup.sh",
+    "configure_networking.sh",
     "zerodisk.sh"
   ],
   :postinstall_timeout => "10000"
