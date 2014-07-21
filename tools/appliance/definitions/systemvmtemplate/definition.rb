@@ -56,8 +56,9 @@ config = {
         'configure_locale.sh',
         'configure_login.sh',
         'configure_networking.sh',
-        'postinstall.sh',
         'configure_acpid.sh',
+        'install_systemvm_packages.sh',
+        'postinstall.sh',
         'configure_conntrack.sh',
         'cleanup.sh',
         'zerodisk.sh'
