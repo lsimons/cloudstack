@@ -37,6 +37,10 @@ Usage:
      (or use command line arg, default i386, other option amd64)
    * Set \$ssh_key to provide root ssh public key to inject
      (or use command line arg, default set in the veewee definition its authorized_keys.sh)
+   * Set \$clean_vbox to try pretty hard to remove all our vms and disk from
+     virtualbox before and after running the rest of the build. This should
+     not be needed since we try hard to use VBoxManage nicely, but, various
+     error conditions / timing issues are quite hard to fully contain
    * Set \$DEBUG=1 to enable debug logging
    * Set \$TRACE=1 to enable trace logging
    * Set \$VEEWEE_ARGS to pass veewee custom arguments
@@ -115,10 +119,13 @@ export VM_ARCH="${arch}"
 # server control
 ssh_key="${6:-${ssh_key:-}}"
 
+# whether to attempt to clean up all our virtualbox vms/disks before/after run
+clean_vbox="${clean_vbox:-}"
+
 # while building with vbox, we need a quite unique appliance name in order to prevent conflicts with multiple
 # concurrent executors on jenkins
 if [ -z "${branch}" ] ; then
-  branch=`git status | grep '# On branch' | awk '{print $4}'`
+  branch=`git status | grep '# On branch' | awk '{print $4}' | sed 's|/|_|g'`
 fi
 
 branch_tag=
@@ -138,6 +145,9 @@ elif [ ! -z "${BUILD_NUMBER}" ]; then
 fi
 
 appliance_build_name=${appliance}${branch_tag}${version_tag}
+
+# mac address of the vm we create
+mac_address=
 
 ###
 ### Generic helper functions
@@ -266,6 +276,17 @@ function setup_ruby() {
   bundle check || bundle install ${bundle_args}
 }
 
+function stop_vbox() {
+  log INFO "stoppping all virtualbox vms for ${USER}"
+  bundle exec ./vbox_vm_clean.rb
+}
+
+function clean_vbox() {
+  log INFO "deleting all virtualbox vms and disks for ${USER}"
+  bundle exec ./vbox_vm_clean.rb --delete
+  bundle exec ./vbox_disk_clean.rb
+}
+
 function prepare() {
   log INFO "preparing for build"
   setup_ruby
@@ -283,9 +304,19 @@ function veewee_destroy() {
 function veewee_build() {
   log INFO "building new image with veewee"
   bundle exec veewee vbox build "${appliance_build_name}" ${VEEWEE_BUILD_ARGS}
-  # vbox export wants to run vbox halt itself, so don't halt!
-  # bundle exec veewee vbox halt "${appliance_build_name}" ${VEEWEE_ARGS}
-  bundle exec veewee vbox export "${appliance_build_name}" ${VEEWEE_ARGS}
+}
+
+function veewee_halt() {
+  log INFO "shutting down new vm with veewee"
+  bundle exec veewee vbox halt "${appliance_build_name}" ${VEEWEE_ARGS}
+}
+
+function save_mac_address() {
+  log INFO "saving new vm mac address"
+  mac_address=`vboxmanage showvminfo --details --machinereadable ${appliance_build_name} | grep macaddress1= | sed 's/macaddress1=//' | sed 's/"//g'`
+  if [ "${mac_address}" == "" ]; then
+    error "Could not find mac address for appliance ${appliance_build_name}"
+  fi
 }
 
 function check_appliance_shutdown() {
@@ -298,6 +329,41 @@ function check_appliance_shutdown() {
     log INFO "...veewee appliance still running"
   fi
   return ${result}
+}
+
+function check_appliance_disk_ready() {
+  log INFO "waiting for veewee appliance disk to be available..."
+  # local hdd_path="vboxmanage showvminfo '${appliance_build_name}' --machinereadable | \
+  #   egrep '(SATA|IDE) Controller-[0-9]+-[0-9]+' | grep -v '.iso' | \
+  #   grep -v '="none"' | egrep -o '=".*"' | sed 's/=//' | sed 's/"//g'"
+  local hdd_path=`vboxmanage list hdds | grep "${appliance_build_name}\/" | grep vdi | \
+      cut -c 14- | sed ${sed_regex_option} 's/^ *//'`
+  disk_state=`vboxmanage showhdinfo "${hdd_path}" | egrep '^State:' | sed 's/State://' | egrep -o '[a-zA-Z]+' | awk '{print tolower($0)}'`
+  if [ "${disk_state}" == "notcreated" ]; then
+    log ERROR "disk ${hdd_path} in state notcreated"
+    return 1
+  elif [ "${disk_state}" == "created" ]; then
+    log INFO "disk ${hdd_path} in state created"
+    return 0
+  elif [ "${disk_state}" == "lockedread" ]; then
+    log INFO "disk ${hdd_path} in state lockedread"
+    return 1
+  elif [ "${disk_state}" == "lockedwrite" ]; then
+    log INFO "disk ${hdd_path} in state lockedwrite"
+    return 1
+  elif [ "${disk_state}" == "inaccessible" ]; then
+    log INFO "disk ${hdd_path} in state inaccessible"
+    return 1
+  elif [ "${disk_state}" == "creating" ]; then
+    log WARN "disk ${hdd_path} in state creating"
+    return 1
+  elif [ "${disk_state}" == "deleting" ]; then
+    log WARN "disk ${hdd_path} in state deleting"
+    return 1
+  else
+    log WARN "disk ${hdd_path} has unknown disk state ${disk_state}"
+    return 1
+  fi
 }
 
 function remove_shares() {
@@ -391,6 +457,32 @@ function vmware_export() {
   log INFO "${appliance} exported for VMWare: dist/${appliance_build_name}-vmware.ova"
 }
 
+function vagrant_export() {
+  log INFO "creating vagrant export"
+  # this is based on veewee export logic, but, we don't want to use veewee export,
+  # since it makes optimistic assumptions about VM shutdown/halt leading to available
+  # disks and the like
+  disk="${appliance_build_name}-vmware.ovf"
+  mkdir -p "box/${appliance_build_name}"
+  cp "${disk}" "box/${appliance_build_name}/box.ovf"
+  cat >box/${appliance_build_name}/Vagrantfile <<END
+Vagrant::Config.run do |config|
+  # This Vagrantfile is auto-generated by vagrant package to contain
+  # the MAC address of the box. Custom configuration should be placed in
+  # the actual Vagrantfile in this box.
+  config.vm.base_mac = "${mac_address}"
+end
+
+# Load include vagrant file if it exists after the auto-generated
+# so it can override any of the settings
+include_vagrantfile = File.expand_path("../include/_Vagrantfile", __FILE__)
+load include_vagrantfile if File.exist?(include_vagrantfile)
+END
+  ( cd box/${appliance_build_name}; tar cf "../${appliance_build_name}.box" . )
+  mv "box/${appliance_build_name}.box" dist/
+  log INFO "${appliance} exported for vagrant: dist/${appliance_build_name}.box"
+}
+
 function hyperv_export() {
   log INFO "creating hyperv export"
   local hdd_uuid="${1}"
@@ -408,11 +500,21 @@ function hyperv_export() {
 
 function main() {
   prepare
+  if [ "${clean_vbox}" == "1" ]; then
+    clean_vbox --delete
+    add_on_exit clean_vbox --delete
+  else
+    stop_vbox # some extra encouragement for virtualbox to stop things
+  fi
   create_definition
   veewee_destroy # in case of left-over cruft from failed build
   add_on_exit veewee_destroy
   veewee_build
+  save_mac_address
+  veewee_halt
+  stop_vbox # some extra encouragement for virtualbox to stop things
   retry 10 check_appliance_shutdown
+  retry 10 check_appliance_disk_ready
   retry 10 remove_shares
 
   # Get appliance uuids
@@ -426,8 +528,9 @@ function main() {
   xen_server_export "${hdd_path}"
   kvm_export "${hdd_path}"
   vmware_export "${machine_uuid}" "${hdd_uuid}"
+  vagrant_export "${machine_uuid}" "${hdd_uuid}"
   hyperv_export "${hdd_uuid}"
-  log INFO "BUILD SUCCESSFUL"
+  add_on_exit log INFO "BUILD SUCCESSFUL"
 }
 
 # we only run main() if not source-d
