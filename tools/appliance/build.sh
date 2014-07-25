@@ -125,7 +125,7 @@ clean_vbox="${clean_vbox:-}"
 # while building with vbox, we need a quite unique appliance name in order to prevent conflicts with multiple
 # concurrent executors on jenkins
 if [ -z "${branch}" ] ; then
-  branch=`git status | grep '# On branch' | awk '{print $4}'`
+  branch=`git status | grep '# On branch' | awk '{print $4}' | sed 's|/|_|g'`
 fi
 
 branch_tag=
@@ -499,13 +499,13 @@ function hyperv_export() {
 ###
 
 function main() {
+  prepare
   if [ "${clean_vbox}" == "1" ]; then
     clean_vbox --delete
     add_on_exit clean_vbox --delete
   else
     stop_vbox # some extra encouragement for virtualbox to stop things
   fi
-  prepare
   create_definition
   veewee_destroy # in case of left-over cruft from failed build
   add_on_exit veewee_destroy
