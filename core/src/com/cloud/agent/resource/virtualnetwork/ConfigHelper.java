@@ -19,13 +19,9 @@
 
 package com.cloud.agent.resource.virtualnetwork;
 
-import java.io.UnsupportedEncodingException;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
-
-import org.apache.commons.codec.binary.Base64;
 
 import com.google.gson.FieldNamingPolicy;
 import com.google.gson.Gson;
@@ -60,10 +56,17 @@ import com.cloud.agent.api.to.IpAddressTO;
 import com.cloud.agent.api.to.NicTO;
 import com.cloud.agent.api.to.PortForwardingRuleTO;
 import com.cloud.agent.api.to.StaticNatRuleTO;
+import com.cloud.agent.resource.virtualnetwork.model.AclRule;
+import com.cloud.agent.resource.virtualnetwork.model.AllAclRule;
 import com.cloud.agent.resource.virtualnetwork.model.GuestNetwork;
+import com.cloud.agent.resource.virtualnetwork.model.IcmpAclRule;
 import com.cloud.agent.resource.virtualnetwork.model.IpAddress;
 import com.cloud.agent.resource.virtualnetwork.model.IpAssociation;
 import com.cloud.agent.resource.virtualnetwork.model.NetworkACL;
+import com.cloud.agent.resource.virtualnetwork.model.ProtocolAclRule;
+import com.cloud.agent.resource.virtualnetwork.model.TcpAclRule;
+import com.cloud.agent.resource.virtualnetwork.model.UdpAclRule;
+import com.cloud.agent.resource.virtualnetwork.model.VmData;
 import com.cloud.network.HAProxyConfigurator;
 import com.cloud.network.LoadBalancerConfigurator;
 import com.cloud.network.rules.FirewallRule;
@@ -99,7 +102,7 @@ public class ConfigHelper {
         } else if (cmd instanceof DeleteIpAliasCommand) {
             cfg = generateConfig((DeleteIpAliasCommand)cmd);
         } else if (cmd instanceof VmDataCommand) {
-            cfg = generateConfig((VmDataCommand)cmd);
+            cfg = generateConfig((VmDataCommand)cmd); // Migrated
         } else if (cmd instanceof SetFirewallRulesCommand) {
             cfg = generateConfig((SetFirewallRulesCommand)cmd);
         } else if (cmd instanceof BumpUpPriorityCommand) {
@@ -113,13 +116,13 @@ public class ConfigHelper {
         } else if (cmd instanceof SetMonitorServiceCommand) {
             cfg = generateConfig((SetMonitorServiceCommand)cmd);
         } else if (cmd instanceof SetupGuestNetworkCommand) {
-            cfg = generateConfig((SetupGuestNetworkCommand)cmd);
+            cfg = generateConfig((SetupGuestNetworkCommand)cmd); // Migrated
         } else if (cmd instanceof SetNetworkACLCommand) {
-            cfg = generateConfig((SetNetworkACLCommand)cmd);
+            cfg = generateConfig((SetNetworkACLCommand)cmd); // Migrated
         } else if (cmd instanceof SetSourceNatCommand) {
-            cfg = generateConfig((SetSourceNatCommand)cmd);
+            cfg = generateConfig((SetSourceNatCommand)cmd); // Migrated - ignored
         } else if (cmd instanceof IpAssocCommand) {
-            cfg = generateConfig((IpAssocCommand)cmd);
+            cfg = generateConfig((IpAssocCommand)cmd); // Migrated
         } else {
             return null;
         }
@@ -315,21 +318,15 @@ public class ConfigHelper {
     }
 
     private static List<ConfigItem> generateConfig(VmDataCommand cmd) {
+        VmData vmData = new VmData(cmd.getVmIpAddress(), cmd.getVmData());
+
         LinkedList<ConfigItem> cfg = new LinkedList<>();
-        Map<String, List<String[]>> data = new HashMap<String, List<String[]>>();
-        data.put(cmd.getVmIpAddress(), cmd.getVmData());
+        ConfigItem networkAclFile = new FileConfigItem(VRScripts.CONFIG_PERSIST_LOCATION, VRScripts.VM_METADATA_CONFIG, gson.toJson(vmData));
+        cfg.add(networkAclFile);
 
-        String json = new Gson().toJson(data);
-        String encoded;
-        try {
-            encoded = Base64.encodeBase64String(json.getBytes("UTF-8"));
-        } catch (UnsupportedEncodingException e) {
-            throw new IllegalArgumentException("Unable retrieve UTF-8 encoded data from vmdata");
-        }
+        ConfigItem updateNetworkACL = new ScriptConfigItem(VRScripts.UPDATE_CONFIG, VRScripts.VM_METADATA_CONFIG);
+        cfg.add(updateNetworkACL);
 
-        String args = "-d " + encoded;
-
-        cfg.add(new ScriptConfigItem(VRScripts.VMDATA, args));
         return cfg;
     }
 
@@ -559,19 +556,44 @@ public class ConfigHelper {
         String netmask = Long.toString(NetUtils.getCidrSize(nic.getNetmask()));
         StringBuilder sb = new StringBuilder();
 
+        List<AclRule> ingressRules = new ArrayList<AclRule>();
+        List<AclRule> egressRules = new ArrayList<AclRule>();
+
         for (int i = 0; i < aclRules.length; i++) {
-            sb.append(aclRules[i]).append(',');
+            AclRule aclRule;
+            String[] ruleParts = aclRules[i].split(":");
+            switch (ruleParts[1].toLowerCase()) {
+            case "icmp":
+                aclRule = new IcmpAclRule(ruleParts[4], "ACCEPT".equals(ruleParts[5]), Integer.parseInt(ruleParts[2]), Integer.parseInt(ruleParts[3]));
+                break;
+            case "tcp":
+                aclRule = new TcpAclRule(ruleParts[4], "ACCEPT".equals(ruleParts[5]), Integer.parseInt(ruleParts[2]), Integer.parseInt(ruleParts[3]));
+                break;
+            case "udp":
+                aclRule = new UdpAclRule(ruleParts[4], "ACCEPT".equals(ruleParts[5]), Integer.parseInt(ruleParts[2]), Integer.parseInt(ruleParts[3]));
+                break;
+            case "all":
+                aclRule = new AllAclRule(ruleParts[4], "ACCEPT".equals(ruleParts[5]));
+                break;
+            default:
+                aclRule = new ProtocolAclRule(ruleParts[4], "ACCEPT".equals(ruleParts[5]), Integer.parseInt(ruleParts[1]));
+            }
+            if ("Ingress".equals(ruleParts[0])) {
+                ingressRules.add(aclRule);
+            } else {
+                egressRules.add(aclRule);
+            }
         }
 
-        String rule = sb.toString();
+        sb.toString();
 
-        NetworkACL networkACL = new NetworkACL(dev, nic.getMac(), privateGw != null, nic.getIp(), netmask, rule);
+        NetworkACL networkACL = new NetworkACL(dev, nic.getMac(), privateGw != null, nic.getIp(), netmask, ingressRules.toArray(new AclRule[ingressRules.size()]),
+                egressRules.toArray(new AclRule[egressRules.size()]));
         ConfigItem networkAclFile = new FileConfigItem(VRScripts.CONFIG_PERSIST_LOCATION, VRScripts.NETWORK_ACL_CONFIG, gson.toJson(networkACL));
         cfg.add(networkAclFile);
 
         ConfigItem updateNetworkACL = new ScriptConfigItem(VRScripts.UPDATE_CONFIG, VRScripts.NETWORK_ACL_CONFIG);
         cfg.add(updateNetworkACL);
-
 
         return cfg;
     }
