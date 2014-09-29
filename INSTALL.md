@@ -40,11 +40,20 @@ Start the MySQL service:
 
 ## Getting the Source Code
 
-You may get the source code from the repository hosted on Apache:
+Links to source code for official cloudstack releases can be retrieved from the cloudstack website at:
+
+    http://cloudstack.apache.org/downloads.html
+
+Alternatively, you may get the source code from the repository hosted on Apache:
 
     $ git clone https://git-wip-us.apache.org/repos/asf/cloudstack.git
 
 Or, you may fork the repository from the official Apache CloudStack mirror on [Github](https://github.com/apache/cloudstack)
+
+To checkout the source code corresponding to a specific release, for example 4.4.1, do:
+
+    $ git fetch origin
+    $ git checkout 4.4.1
 
 To checkout a specific branch, for example 4.4, do:
 
